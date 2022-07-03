@@ -1,0 +1,15 @@
+name = "PHOENIXgrid"
+uuid = "a9bb3d03-3c58-43ee-ab8e-d54b69acc019"
+authors = ["Jarle Brinchmann <jbrinchmann@gmail.com>"]
+version = "0.1.0"
+
+[deps]
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]
+
+[compat]
+julia = "^1"
