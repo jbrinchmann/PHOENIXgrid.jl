@@ -152,6 +152,14 @@ function fit_one_spectrum(sp_obs, sp_M; vmin=-100, vmax=100, vstep=1.0,
 end
 
 
+#
+"""fit_grid(sp_obs, grid, keep, dims; kwargs)
+
+Fit a grid of PHOENIX models to the observed spectrum in sp_obs.
+The spectrum must be a dict with keys :λ, :flux, :dflux.
+
+The 
+"""
 function fit_grid(sp_obs, grid, keep, dims; vmin=-100., vmax=100.0, vstep=1.0,
                   around=nothing, balmeronly=false)
 
@@ -212,8 +220,11 @@ function fit_grid(sp_obs, grid, keep, dims; vmin=-100., vmax=100.0, vstep=1.0,
     # I took this out of the loop because we need to subtract off the
     # minimum χ2. 
     p = exp.(.-(χ2.-min_chi2)./2.0)
-    
-    return vaxis, χ2, A, p, min_chi2, i_min
+
+    result = GridFitResult(p, A, min_chi2, i_min, vaxis, dims[:logg], dims[:Teff],
+                           dims[:FeH], dims[:alpha])
+
+    return result
 end
 
 
