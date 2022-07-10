@@ -2,26 +2,35 @@
 # Routines for fitting a spectrum against a model. This is Bayesian and gridded.
 #
 
+global const cspeed = 299792.458
+
+
+
 """Return the scaling from the χ² calculation in the fit_one_spectrum function"""
 function scale(f, fM, σ)
 
     Ω1 = 0.0
     Ω2 = 0.0
     for i=1:length(f)
-        s2 = σ[i]^2
-        Ω1 = Ω1 + f[i]*fM[i]/s2
-        Ω2 = Ω2 + fM[i]^2/s2
+        if (isfinite(f[i]))
+            # Ignore NaNs
+            s2 = σ[i]^2
+            Ω1 = Ω1 + f[i]*fM[i]/s2
+            Ω2 = Ω2 + fM[i]^2/s2
+        end
     end
-
     return Ω1/Ω2
 end
 
 
 """Internal function for interpolation
+
+This relies on the fact that the PHOENIX grid is equally sampled in log λ. 
+There are no assumptions on the sampling of the observed spectrum.
+
 """
 function _fast_interpolate(λobs, λM, fM, v)
 
-    cspeed = 299792.458
     # Then some useful variables for the interpolation below
     Nobs = length(λobs)
     ΔlogλM = 3e-5 # Fixed for PHOENIX grids
@@ -42,6 +51,23 @@ function _fast_interpolate(λobs, λM, fM, v)
 
     return fMshifted
 end
+
+function ensure_finite_spectrum(sp)
+
+    x = sp[:λ]
+    y = sp[:flux]
+    dy = sp[:dflux]
+    N = length(x)
+
+    xout = [x[i] for i=1:N if (isfinite(y[i])) & (dy[i] > 0)]
+    yout = [y[i] for i=1:N if (isfinite(y[i])) & (dy[i] > 0)]
+    dyout = [dy[i] for i=1:N if (isfinite(y[i])) & (dy[i] > 0)]
+    
+
+    spout = Dict(:λ => xout, :flux => yout, :dflux => dyout)
+    return spout
+end
+
 
 """Fit a model to an observed spectrum
     
@@ -64,16 +90,26 @@ interpolate it onto the observed wavelength vector.
 
 """
 function fit_one_spectrum(sp_obs, sp_M; vmin=-100, vmax=100, vstep=1.0,
-                          around=nothing, balmeronly=false)
+                          around=nothing, balmeronly=false, dataisfinite=false)
 
     # Prepare some variables - some are just for readability below
     velocities = collect(vmin:vstep:vmax)
     λM = sp_M[:λ]
     fM = sp_M[:flux]
+    NM = length(fM)
+
+    # The observed spectrum. 
+    # Keep only good data unless the caller ensures us that the
+    # data are finite.
+    if !dataisfinite
+        sp_obs = ensure_finite_spectrum(sp_obs)
+    end
     λobs = sp_obs[:λ]
     fobs = sp_obs[:flux]
     dfobs = sp_obs[:dflux]
-    NM = length(fM)
+    Nobs = length(fobs)
+
+        
 
     if balmeronly
         around = [4861.325, 6562.8]
@@ -96,9 +132,9 @@ function fit_one_spectrum(sp_obs, sp_M; vmin=-100, vmax=100, vstep=1.0,
     
     # I could get this from PhysicalConstants.jl but as it is the only
     # one I expect I need, I won't bother. To be checked.
-    cspeed = 299792.458
 
     χ2 = zeros(length(velocities))
+    Scales = zeros(length(velocities))
     for i=1:length(velocities)
         
         # We do an inline interpolation to speed things up - note that we
@@ -108,11 +144,11 @@ function fit_one_spectrum(sp_obs, sp_M; vmin=-100, vmax=100, vstep=1.0,
         fMshifted = _fast_interpolate(λobs, λM, fM, velocities[i])
         # Compare the two.
         A = scale(fobs, fMshifted, dfobs)
-
+        Scales[i] = A
         χ2[i] = sum(((fobs.-A.*fMshifted).*w).^2)
     end
     
-    return Dict(:v=>velocities, :chi2 => χ2)
+    return Dict(:v=>velocities, :chi2 => χ2, :A => Scales)
 end
 
 
@@ -122,10 +158,15 @@ function fit_grid(sp_obs, grid, keep, dims; vmin=-100., vmax=100.0, vstep=1.0,
     # The dimensionality of it all
     Nλ, Ng, NT, NZ, Na = size(grid)
 
+    # We do not want any NaNs
+    sp_obs = ensure_finite_spectrum(sp_obs)
+    
     N_spobs = length(sp_obs[:flux])
     
-    local χ2, vaxis, p
+    local χ2, vaxis, p, A
     min_chi2 = 1e30
+    # The index of the minimum model
+    i_min = [-1, -1, -1, -1, -1]
     first = true
     for ig=1:Ng
         for iT=1:NT
@@ -137,21 +178,30 @@ function fit_grid(sp_obs, grid, keep, dims; vmin=-100., vmax=100.0, vstep=1.0,
                     end
                     sp_M = Dict(:λ => dims[:λ], :flux => grid[:, ig, iT, iZ, ia])
                     res = fit_one_spectrum(sp_obs, sp_M; vmin=vmin, vmax=vmax,
-                                           vstep=vstep, around=around, balmeronly=balmeronly)
+                                           vstep=vstep, around=around, balmeronly=balmeronly,
+                                           dataisfinite=true)
 
                     if first
                         vaxis = res[:v]
                         Nv = length(vaxis)
                         χ2 = fill(-9999.0, Nv, Ng, NT, NZ, Na)
                         p = fill(0.0, Nv, Ng, NT, NZ, Na)
+                        A = fill(0.0, Nv, Ng, NT, NZ, Na)
                         first = false
                     end
 
                     tmp = res[:chi2]
                     χ2[:, ig, iT, iZ, ia] = tmp
-
-                    if minimum(tmp) < min_chi2
-                        min_chi2 = minimum(tmp)
+                    A[:, ig, iT, iZ, ia] = res[:A]
+                    
+                    ok = [i for i in 1:length(tmp) if tmp[i] > 0]
+                    if length(ok) > 0
+                        i_tmp = argmin(tmp[ok])
+                        i_min_v = ok[i_tmp]
+                        if tmp[i_min_v] < min_chi2
+                            min_chi2 = tmp[i_min_v]
+                            i_min = [i_min_v, ig, iT, iZ, ia]
+                        end
                     end
                 end
             end
@@ -163,7 +213,7 @@ function fit_grid(sp_obs, grid, keep, dims; vmin=-100., vmax=100.0, vstep=1.0,
     # minimum χ2. 
     p = exp.(.-(χ2.-min_chi2)./2.0)
     
-    return vaxis, χ2, p, min_chi2
+    return vaxis, χ2, A, p, min_chi2, i_min
 end
 
 
@@ -286,21 +336,26 @@ function create_prior_grid(p, vaxis, dims; v=nothing, logg=nothing,
     if Teff != nothing
         tmp = _create_prior(dims[:Teff], Teff)
         y = repeat(tmp, 1, Nv, Ng, NZ, Na);
-        y = permutedims(y, [3, 1, 2, 4, 5])
+        y = permutedims(y, [2, 3, 1, 4, 5])
         prior = prior.*y
     end
     
     if FeH != nothing
         tmp = _create_prior(dims[:FeH], FeH)
         y = repeat(tmp, 1, Nv, Ng, NT, Na);
-        y = permutedims(y, [4, 1, 2, 3, 5])
+        y = permutedims(y, [2, 3, 4, 1, 5])
         prior = prior.*y
     end
 
     if alpha != nothing
         tmp = _create_prior(dims[:alpha], alpha)
         y = repeat(tmp, 1, Nv, Ng, NT, NZ);
-        y = permutedims(y, [5, 1, 2, 3, 4])
+#        println("Prior dimension=",size(prior))
+#        println("    y dimension=",size(y))
+#        println("  tmp dimension=",size(tmp))
+        y = permutedims(y, [2, 3, 4, 5, 1])
+#        println("    y dimension=",size(y))
+
         prior = prior.*y
     end
 
@@ -328,7 +383,7 @@ function marginalise(p, dims, keep; ignore_missing=false, pfull=nothing,
     end
     # Apply prior if needed
     if prior != nothing
-        pfull = pfull*prior
+        pfull = pfull.*prior
     end
     
     Nv, Ng, NT, NZ, Na = size(pfull)
@@ -407,6 +462,183 @@ function marginalise(p, dims, keep; ignore_missing=false, pfull=nothing,
     end
 
     return res
+end
+
+
+"""Convenience function that maps between strings and symbols for the 
+    marginalisation results"""
+function marginalisation_keymap()
+    k = Dict("v" => :P_v, "logg" => :P_logg, "Teff" => :P_Teff,
+             "FeH" => :P_FeH, "Z" => :P_FeH, "alpha" => :P_a,
+             "vlogg" => :P_vg, "vTeff" => :P_vT, "vFeH" => :P_vZ,
+             "vZ" => :P_vZ, "valpha" => :P_va, "loggTeff" => :P_gT,
+             "loggZ" => :P_gZ, "loggFeH" => :P_gZ, "loggalpha" => :P_ga,
+             "TeffZ" => :P_TZ, "TeffFeH" => :P_TZ, "Teffalpha" => :P_Ta,
+             "FeHalpha" => :P_Za, "Zalpha" => :P_Za)
+end
+
+
+
+
+"""Given the result from marginalise - calculate quantiles of the PDFs"""
+function summarise_results(dims, m)
+
+
+    q, ss_v = quantiles_epdf(dims[:v], m[:P_v])
+    q, ss_g = quantiles_epdf(dims[:logg], m[:P_logg])
+    q, ss_T = quantiles_epdf(dims[:Teff], m[:P_Teff])
+    q, ss_Z = quantiles_epdf(dims[:FeH], m[:P_FeH])
+    q, ss_a = quantiles_epdf(dims[:alpha], m[:P_a])
+    
+    return Dict(:v => ss_v, :logg => ss_g, :Teff => ss_T,
+                :FeH => ss_Z, :alpha => ss_a, :quantiles => q)
+end
+
+
+"""Given the results from the function above - print a summary"""
+function print_results(s)
+
+    # This relies on the format used above
+    i_p16 = argmin(abs.(s[:quantiles].-0.16))
+    i_p50 = argmin(abs.(s[:quantiles].-0.50))
+    i_p84 = argmin(abs.(s[:quantiles].-0.84))
+    
+    @printf "   v = %0.2f [%0.2f, %0.2f]\n" s[:v][i_p50] s[:v][i_p16] s[:v][i_p84]
+    @printf "Teff = %0.2f [%0.2f, %0.2f]\n" s[:Teff][i_p50] s[:Teff][i_p16] s[:Teff][i_p84]
+    @printf "Fe/H = %0.2f [%0.2f, %0.2f]\n" s[:FeH][i_p50] s[:FeH][i_p16] s[:FeH][i_p84]
+    @printf "logg = %0.2f [%0.2f, %0.2f]\n" s[:logg][i_p50] s[:logg][i_p16] s[:logg][i_p84]
+    @printf "α/Fe = %0.2f [%0.2f, %0.2f]\n" s[:alpha][i_p50] s[:alpha][i_p16] s[:alpha][i_p84]
+
+end
+
+
+
+"""Find the first crossing of the function with target value"""
+function lin_interp_solve(x, y, y_wanted; istart=1)
+    if length(x) != length(y)
+        println("Problem!!!")
+        println("x=", x)
+        println("y=", y)
+        raise
+    end
+    i_below = -1
+    i_above = -1
+    previous_diff = y[1]-y_wanted
+    for i=istart:length(x)
+        # Check first for equality
+        if y[i] == y_wanted
+            i_below = i
+            i_above = i
+            break
+        else
+            diff = y[i]-y_wanted
+            if sign(diff) != sign(previous_diff)
+                # We have a zero-crossing!
+                i_below = i-1
+                i_above = i
+                break
+            end
+        end
+    end
+
+    if i_below < 1
+        solution = nothing
+    else
+        # Ok we have a solution. If this is exact it is easy
+        if (i_below == i_above)
+            solution = x[i_below]
+        else
+            # Linear interpolation needed
+            delta_y = y[i_above]-y[i_below]
+            delta_x = x[i_above]-x[i_below]
+
+            solution = x[i_below] + (y_wanted-y[i_below])*delta_x/delta_y
+        end
+    end
+
+    return solution
+end
+
+"""Find quantiles for a given probability distribution"""
+function quantiles_epdf(x_pdf, pdf; quantiles=[0.025, 0.16, 0.5, 0.84, 0.975])
+
+    N_q = length(quantiles)
+    cpdf = cumsum(pdf, dims=1)
+    cpdf = cpdf/maximum(cpdf)
+    values = zeros(N_q)
+
+
+    # Check for finiteness
+    if !all(isfinite.(cpdf))
+        println("PDF with NaNs!")
+        values = [NaN for i in 1:N_q]
+    else
+        for i=1:N_q
+            tmp = lin_interp_solve(x_pdf, cpdf, quantiles[i])
+            if tmp == nothing
+                values[i] = -99999.0
+            else
+                values[i] = tmp
+            end
+            
+        end
+    end
+    
+    return (quantiles, values)
+end
+
+function stringify_q(q)
+    tmp = @sprintf "%.1f" 100*q
+    return replace(tmp, "." => "p")
+end
+    
+
+#
+# Functions to get back spectra
+#
+
+"""get_best_fit
+
+Create a best-fit spectrum using the model. This function just gets the best fit
+model."""
+function get_best_fit(dims, g, A, i_min; λobs=4750:1.25:9300)
+
+
+    i_v, i_g, i_T, i_Z, i_a = i_min
+
+    # The best-fit velocity
+    best_v = dims[:v][i_v]
+    
+    # Get the spectrum at velocity=0.0
+    fM = g[:, i_g, i_T, i_Z, i_a]
+
+    # Interpolate it in velocity
+    fMobs = _fast_interpolate(λobs, dims[:λ], fM, best_v)
+    
+    # Scale it by the best-fit scale
+    fMobs = fMobs .* A[i_v, i_g, i_T, i_Z, i_a]
+
+    return Dict(:λ => λobs, :flux => fMobs, :scl=>A[i_v,i_g,i_T, i_Z, i_a],
+                :modelflux => fM)
+end
+
+
+
+"""get_fitted_spectrum_pdf
+
+Create a best-fit spectrum using full likelihood. This loops over all models
+and constructs a median spectrum and the quantiles around this.  However it does
+this per velocity and then combines again over velocity. 
+"""
+function get_best_fit(dims, g, A, p; λobs=4750:1.25:9300)
+
+
+    
+
+
+    
+    return Dict(:λ => λobs, :flux => fMobs, :scl=>A[i_v,i_g,i_T, i_Z, i_a],
+                :modelflux => fM)
 end
 
 
