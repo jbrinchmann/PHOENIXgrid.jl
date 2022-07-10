@@ -111,3 +111,72 @@ function load_grid_of_spectra(;grid=nothing)
     
     return λ, spectra, keep, dims
 end
+
+
+"""Create a mask for a spectrum. It is possible to specify regions as well as
+lines with widths around to keep.
+
+Examples: 
+
+  regions - a vector of vectors that specifies the regions. E.g:
+            regions = [[4750, 5000.0], [6300, 6310], [4370, 4400]]
+
+
+"""
+function make_spectrum_mask(sp; regions=[], lines=[], width=10.0)
+
+    Nλ = length(sp[:λ])
+    mask = zeros(Nλ) # To start with, all is masked.
+
+    # We loop over all wavelengths and for each we check whether
+    # we are in a region or close to a line to keep.
+
+    for i=1:Nλ
+
+        λ = sp[:λ][i]
+
+        # First check the regions
+        for r in regions
+            if (λ >= r[1]) & (λ <= r[2])
+                mask[i]=1
+            end
+        end
+
+        # Then check the lines
+        for l in lines
+            if (λ >= l-width/2.0) & (λ <= l+width/2.0)
+                mask[i]=1
+            end
+        end        
+    end
+
+    return mask
+end
+
+
+"""This function gets a mask for the spectrum and then either
+    subsets the spectrum or sets the uncertainty in the masked 
+    regions to very high values"""
+function mask_spectrum(sp; subset=false, kwargs...)
+    
+    mask = make_spectrum_mask(sp; kwargs...)
+
+    
+    if subset
+        inds = [i for i in 1:length(mask) if mask[i] == 1]
+
+        spout = Dict(:λ => sp[:λ][inds],
+                     :flux => sp[:flux][inds])
+        if :dflux in keys(sp)
+            spout[:dflux] = sp[:dflux][inds]
+        end
+    else
+        spout = copy(sp)
+        
+        inds = [i for i in 1:length(mask) if mask[i] == 0]
+        spout[:dflux][inds] .= 1e30
+    end
+
+    return spout
+    
+end
